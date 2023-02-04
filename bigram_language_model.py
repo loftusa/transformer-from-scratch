@@ -47,7 +47,7 @@ def get_batch(data, batch_size=4, block_size=8):
     ix = torch.randint(max_idx, size=(batch_size,))
     X = torch.stack([data[i : i + block_size] for i in ix])
     y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
-    x, y = x.to(device), y.to(device)
+    X, y = X.to(device), y.to(device)
     return X, y
 
 
@@ -103,7 +103,7 @@ class BigramLanguageModel(nn.Module):
         append sample to running sequence
         """
         for _ in range(max_new_tokens):
-            # idx is (B x T)
+            # idx is (B, T)
             logits, _ = self(idx)
             # focus only on the last timestep
             logits = logits[:, -1, :]  # becomes (B, C)
@@ -122,14 +122,13 @@ X, y = get_batch(data, batch_size=batch_size, block_size=block_size)
 #         target = X[batch_idx, token_idx : token_idx + 1]
 #         print(f"When X is {X[batch_idx, :token_idx]}, the next word is {target}")
 
-blm = BigramLanguageModel(vocabulary)
+blm = BigramLanguageModel(chars)
 logits, loss = blm(X, y)
 
 # get a generation with a zero initiation and 100 new tokens
 generation = blm.generate(
     idx=torch.zeros((1, 1), dtype=torch.long), max_new_tokens=100
 )[0].tolist()
-print(decode(generation))
 
 # train
 # Create an optimization object (which eats the parameters of a model)
@@ -142,7 +141,7 @@ print(decode(generation))
 optimizer = torch.optim.AdamW(blm.parameters(), lr=1e-3)
 batch_size = 32
 block_size = 8
-for step in range(1000):
+for step in range(10000):
     xb, yb = get_batch(data, batch_size=batch_size, block_size=block_size)
     logits, loss = blm(xb, yb)
     optimizer.zero_grad(set_to_none=True)
@@ -157,4 +156,23 @@ with torch.no_grad():
     ].tolist()
     print(decode(idx))
 
-#%%
+#%% [markdown]
+# ## The mathematical trick in self-attention
+A = torch.tril(torch.ones(3, 3, dtype=torch.float64))
+A /= A.sum(dim=1, keepdim=True)  # each row is divided by its sum (count of 1s)
+B = torch.arange(3 * 3, dtype=torch.float64).reshape(3, 3) + 1
+
+torch.manual_seed(42)
+B, T, C = 4, 8, 2
+x = torch.randn(B, T, C)
+
+
+# create x, random batch of shape (B, T, C)
+xbow = torch.zeros((B, T, C))
+for b in range(B):
+    for t in range(T):
+        xprev = x[b, : t + 1]
+        xbow[b, t] = torch.mean(xprev, 0)
+
+
+# make x[b, t] = mean_{i<=r} x[b, i]
