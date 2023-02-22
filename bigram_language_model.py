@@ -3,15 +3,20 @@ import datasets
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.functional import softmax
 
 # hyperparameters
-batch_size = 32
-block_size = 8
+batch_size = 4  # B
+block_size = 25  # T
 max_iters = 3000
 eval_interval = 300
-learning_rate = 1e-2
+learning_rate = 1e-3
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_iters = 200
+n_embd = 32
+n_head = 6
+n_layer = 6
+dropout = 0.2
 
 # -----------------
 
@@ -55,7 +60,7 @@ def get_batch(data, batch_size=4, block_size=8):
 def estimate_loss(model):
     out = {}
     model.eval()
-    for split in [train, validation]:
+    for split in [train, val]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
@@ -66,30 +71,89 @@ def estimate_loss(model):
     return out
 
 
+class AttentionHead(nn.Module):
+    """
+    B --> batch size
+    T --> number of tokens in each block
+    D --> embedding dimension (equal to the vocab size, C?)
+
+    karpathy:
+    - block_size = n_embd = T
+    - n_embd = head_size = C
+    """
+
+    def __init__(self, head_size, mask=True):
+        super().__init__()
+
+        # matrices and attributes
+        self.K = nn.Linear(n_embd, head_size, bias=False)
+        self.Q = nn.Linear(n_embd, head_size, bias=False)
+        self.V = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+
+        # hyperparameters
+        self.mask = mask
+
+    def _mask(self, xx):
+        xx = torch.where(self.tril == 0, -1 * torch.inf, xx)
+        return xx
+
+    def forward(self, x):
+        B, T, D = x.shape
+        k = self.K(x)  # (B, T, D)
+        q = self.Q(x)  # (B, T, D)
+
+        # compute attention
+        attn_matrix = (
+            q @ k.transpose(-2, -1)
+        ) * D**-0.5  # (B, T, D) @ (B, D, T) --> (B, T, T)
+        attn_matrix = attn_matrix.masked_fill(
+            self.tril[:T, :T] == 0, float("-inf")
+        )  # (B, T, T)
+        attn_matrix = softmax(attn_matrix, dim=-1)
+        v = self.V(x)  # (B, T, T) @ (B, T, D) --> (B, T, D)
+        out = attn_matrix @ v  # (B, T, D)
+        return out
+
+
 class BigramLanguageModel(nn.Module):
+    """
+    T --> n_embed, block_size
+    D/C --> vocab length
+    B --> batch size
+    """
+
     def __init__(self, vocabulary):
         super().__init__()
-        C = len(vocabulary)
-        self.embedding_table = nn.Embedding(C, C)  # (n_vocab, n_vocab)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.sa_head = AttentionHead(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, X, y=None):
         """
         takes a batch, returns the loss and target for that batch
         """
         # x \in (batch_size, block_size)
-        logits = self.embedding_table(
-            X
-        )  # (batch_size, block_size, n_tokens) = (B, T, C)
+        B, T = X.shape
+        tok_emb = self.token_embedding_table(X)  # (B, T, D)
+        pos_emb = self.position_embedding_table(
+            torch.arange(T, device=device)
+        )  # (T, D)
+        x = tok_emb + pos_emb
+        x = self.sa_head(x)  # (B, T, C)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+
         if y is None:
             loss = None
         else:
-            B, T, C = logits.shape
-            logits = logits.view(B * T, C)
+            B, T, D = logits.shape
+            logits = logits.view(B * T, D)
             y = y.view(B * T)
 
-            # where C is n_classes, N is batch_size
-            # cross_entropy requires shape (C) or shape (N, C),
-            # but our data is (N, block_size, C)
+            # where D is n_classes, N is batch_size
+            # cross_entropy requires shape (D) or shape (N, D),
+            # but our data is (N, block_size, D)
             loss = F.cross_entropy(logits, y)
 
         return logits, loss
@@ -104,10 +168,11 @@ class BigramLanguageModel(nn.Module):
         """
         for _ in range(max_new_tokens):
             # idx is (B, T)
-            logits, _ = self(idx)
+            idx_cond = idx[:, -block_size:]
+            logits, _ = self(idx_cond)
             # focus only on the last timestep
-            logits = logits[:, -1, :]  # becomes (B, C)
-            probs = F.softmax(logits, dim=-1)  # (B, C)
+            logits = logits[:, -1, :]  # becomes (B, D)
+            probs = F.softmax(logits, dim=-1)  # (B, D)
             idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
             idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
 
@@ -115,13 +180,6 @@ class BigramLanguageModel(nn.Module):
 
 
 X, y = get_batch(data, batch_size=batch_size, block_size=block_size)
-
-# for batch_idx in range(batch_size):
-#     for token_idx in range(block_size):
-#         vals = X[batch_idx, :token_idx]
-#         target = X[batch_idx, token_idx : token_idx + 1]
-#         print(f"When X is {X[batch_idx, :token_idx]}, the next word is {target}")
-
 blm = BigramLanguageModel(chars)
 logits, loss = blm(X, y)
 
@@ -139,8 +197,6 @@ generation = blm.generate(
 #    and then step forward on the optimizer
 
 optimizer = torch.optim.AdamW(blm.parameters(), lr=1e-3)
-batch_size = 32
-block_size = 8
 for step in range(10000):
     xb, yb = get_batch(data, batch_size=batch_size, block_size=block_size)
     logits, loss = blm(xb, yb)
