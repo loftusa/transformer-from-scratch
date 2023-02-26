@@ -5,6 +5,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.functional import softmax
 
+
 # hyperparameters
 batch_size = 4  # B
 block_size = 25  # T
@@ -14,9 +15,14 @@ learning_rate = 1e-3
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_iters = 200
 n_embd = 32
-n_head = 6
-n_layer = 6
+n_head = 4
+n_layer = 3
 dropout = 0.2
+assert n_embd / n_head == n_embd // n_head
+
+head_size = (
+    10  # TODO: I think there's some theoretical bound on what this val should be
+)
 
 # -----------------
 
@@ -94,10 +100,6 @@ class AttentionHead(nn.Module):
         # hyperparameters
         self.mask = mask
 
-    def _mask(self, xx):
-        xx = torch.where(self.tril == 0, -1 * torch.inf, xx)
-        return xx
-
     def forward(self, x):
         B, T, D = x.shape
         k = self.K(x)  # (B, T, D)
@@ -116,32 +118,81 @@ class AttentionHead(nn.Module):
         return out
 
 
+class MultiHeadedAttention(nn.Module):
+    """
+    Make a bunch of attention heads,
+    calculate attention on all of them,
+    concatenate them together,
+    then run the result through a feedforward layer
+    """
+
+    def __init__(self, n_head, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([AttentionHead(head_size) for _ in range(n_head)])
+        self.proj = nn.Linear(n_embd, n_embd)
+
+    def forward(self, x):
+        B, T, D = x.shape
+        out = torch.cat([head(x) for head in self.heads], axis=-1)  # (B, T, D*n_embd)
+        return self.proj(out)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd), 
+            nn.ReLU(), 
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(p=dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa_heads = MultiHeadedAttention(n_head, head_size)
+        self.ffn = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa_heads(self.ln1(x))
+        x = x + self.ffn(self.ln2(x))
+        return x
+
+
 class BigramLanguageModel(nn.Module):
     """
-    T --> n_embed, block_size
-    D/C --> vocab length
+    T --> block_size
+    C --> vocab length
+    D --> n_embd
     B --> batch size
     """
 
-    def __init__(self, vocabulary):
+    def __init__(self):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.sa_head = AttentionHead(n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head) for _ in range(n_layer)])
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, X, y=None):
         """
         takes a batch, returns the loss and target for that batch
         """
-        # x \in (batch_size, block_size)
+        # x \in (batch_size, block_size) == (B, T)
         B, T = X.shape
         tok_emb = self.token_embedding_table(X)  # (B, T, D)
         pos_emb = self.position_embedding_table(
             torch.arange(T, device=device)
         )  # (T, D)
-        x = tok_emb + pos_emb
-        x = self.sa_head(x)  # (B, T, C)
+        x = tok_emb + pos_emb  # (B, T, D)
+        x = self.blocks(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
         if y is None:
@@ -180,7 +231,7 @@ class BigramLanguageModel(nn.Module):
 
 
 X, y = get_batch(data, batch_size=batch_size, block_size=block_size)
-blm = BigramLanguageModel(chars)
+blm = BigramLanguageModel()
 logits, loss = blm(X, y)
 
 # get a generation with a zero initiation and 100 new tokens
@@ -197,6 +248,7 @@ generation = blm.generate(
 #    and then step forward on the optimizer
 
 optimizer = torch.optim.AdamW(blm.parameters(), lr=1e-3)
+
 for step in range(10000):
     xb, yb = get_batch(data, batch_size=batch_size, block_size=block_size)
     logits, loss = blm(xb, yb)
